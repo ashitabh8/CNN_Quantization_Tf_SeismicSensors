@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import sys
+from typing import List, Tuple, Optional
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
+try:
+    import tensorflow as tf
+    from tensorflow import keras
+except Exception as e:
+    print("TensorFlow is required to run this generator.")
+    raise
+
+
+SUPPORTED_LAYERS = (
+    keras.layers.InputLayer,
+    keras.layers.Conv2D,
+    keras.layers.Dense,
+    keras.layers.GlobalAveragePooling2D,
+    keras.layers.Flatten,
+    keras.layers.Activation,
+    keras.layers.Softmax,
+    keras.layers.ReLU,
+)
+
+
+def _shape_tuple(shape) -> Tuple[int, ...]:
+    return tuple(int(d) if d is not None else -1 for d in shape)
+
+
+def load_model(model_path: str):
+    # Try SavedModel, then keras H5/keras format
+    if os.path.isdir(model_path):
+        try:
+            return keras.models.load_model(model_path)
+        except Exception:
+            return None
+    # File case
+    try:
+        return keras.models.load_model(model_path)
+    except Exception as e:
+        print(f"Failed to load model from {model_path}: {e}")
+        return None
+
+
+def try_build_from_saved_model(model_dir: str):
+    # Build a lightweight descriptor from SavedModel variables when Keras cannot load it.
+    # Returns a dict with keys: 'variables' (name->np.array), and 'summary_path'.
+    import numpy as np
+    if not (os.path.isdir(model_dir) and os.path.exists(os.path.join(model_dir, 'saved_model.pb'))):
+        return None
+    try:
+        obj = tf.saved_model.load(model_dir)
+    except Exception:
+        return None
+    variables = {}
+    # Gather variables from the loaded object; they often have names like 'serving_default/...'
+    try:
+        for v in obj.variables:
+            try:
+                variables[v.name.rstrip(":0")] = v.numpy()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Also traverse trackables if possible
+    try:
+        for w in obj.trainable_variables:
+            variables[w.name.rstrip(":0")] = w.numpy()
+    except Exception:
+        pass
+    summary_path = os.path.join(os.path.dirname(model_dir), 'model_summary.txt')
+    return {
+        'variables': variables,
+        'summary_path': summary_path if os.path.exists(summary_path) else None,
+    }
+
+
+def parse_summary_layers(summary_path: str):
+    layers = []  # list of (name, type)
+    try:
+        with open(summary_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line.startswith('│') and not line.startswith('|'):
+                    continue
+                # Try to extract like: │ conv1 (Conv2D) │
+                if '(' in line and ')' in line:
+                    seg = line.replace('│', '|').split('|')
+                    if len(seg) < 2:
+                        continue
+                    cell = seg[1].strip()
+                    if ' (' in cell and cell.endswith(')'):
+                        name = cell.split(' (')[0].strip()
+                        typ = cell.split('(')[1].split(')')[0].strip()
+                        layers.append((name, typ))
+    except Exception:
+        pass
+    return layers
+
+
+def build_steps_from_saved_model(model_dir: str, input_shape: 'TensorShape'):
+    import numpy as np
+    sm = try_build_from_saved_model(model_dir)
+    if sm is None:
+        raise ValueError(f"Cannot read SavedModel variables from {model_dir}")
+    variables = sm['variables']
+    order_from_summary = parse_summary_layers(sm['summary_path']) if sm['summary_path'] else []
+    # Filter only supported layers in order
+    supported_types = {'Conv2D', 'GlobalAveragePooling2D', 'Dense', 'Flatten', 'Softmax', 'Activation'}
+    ordered = [(n, t) for (n, t) in order_from_summary if t in supported_types]
+    if not ordered:
+        # Fallback: infer from variable names heuristically
+        # Collect bases that end with /kernel
+        bases = []
+        for k in variables.keys():
+            if k.endswith('/kernel'):
+                bases.append(k[:-len('/kernel')])
+        bases.sort()
+        ordered = [(b.split('/')[-1], 'Conv2D') for b in bases]
+
+    steps = []
+    cur = input_shape
+    for name, typ in ordered:
+        base = name
+        if typ == 'Conv2D':
+            # Try several name patterns
+            k = None
+            b = None
+            cand_prefixes = [base, f"{base}/conv2d", f"{base}/kernel", f"{base}/Conv2D", f"{base}/conv1", f"{base}/conv"]
+            for pref in cand_prefixes:
+                k = variables.get(f"{pref}/kernel") or variables.get(f"{pref}")
+                if k is not None:
+                    b = variables.get(f"{pref}/bias")
+                    base = pref
+                    break
+            if k is None:
+                # Try prefixed names
+                # find any key that endswith /kernel and contains base
+                for key in variables.keys():
+                    if key.endswith('/kernel') and base in key:
+                        k = variables[key]
+                        base = key[:-len('/kernel')]
+                        b = variables.get(base + '/bias')
+                        break
+            if k is None:
+                continue
+            k_h, k_w, c_in, c_out = k.shape
+            # Assume stride 1, SAME if output H/W equals input H/W; we don't know output yet, but summary shows fixed HW.
+            strides = (1, 1)
+            padding = 'SAME'
+            out_shape = infer_output_shape_conv2d(cur, type('L', (), {'strides': strides, 'padding': padding, 'kernel_size': (k_h, k_w), 'filters': c_out}))
+            steps.append({
+                'type': 'conv2d',
+                'name': base.replace('/', '_'),
+                'in_shape': cur,
+                'out_shape': out_shape,
+                'kernel': k,
+                'bias': b,
+                'strides': strides,
+                'padding': padding,
+            })
+            cur = out_shape
+        elif typ == 'GlobalAveragePooling2D':
+            out_shape = infer_output_shape_gap2d(cur)
+            steps.append({'type': 'gap2d', 'name': base.replace('/', '_'), 'in_shape': cur, 'out_shape': out_shape})
+            cur = out_shape
+        elif typ == 'Dense':
+            W = None
+            b = None
+            cand_prefixes = [base, f"{base}/dense", f"{base}/kernel", f"{base}/Dense", f"{base}/classifier"]
+            for pref in cand_prefixes:
+                W = variables.get(f"{pref}/kernel") or variables.get(f"{pref}")
+                if W is not None:
+                    b = variables.get(f"{pref}/bias")
+                    base = pref
+                    break
+            if W is None:
+                for key in variables.keys():
+                    if key.endswith('/kernel') and base in key:
+                        W = variables[key]
+                        base = key[:-len('/kernel')]
+                        b = variables.get(base + '/bias')
+                        break
+            if W is None:
+                continue
+            in_features, out_features = W.shape
+            steps.append({
+                'type': 'dense',
+                'name': base.replace('/', '_'),
+                'in_features': in_features,
+                'out_features': out_features,
+                'W': W,
+                'b': b,
+            })
+            cur = TensorShape(1, 1, out_features)
+        elif typ == 'Flatten':
+            steps.append({'type': 'flatten', 'name': base.replace('/', '_'), 'in_shape': cur, 'out_features': cur.numel()})
+            cur = TensorShape(1, 1, cur.numel())
+        elif typ == 'Softmax':
+            steps.append({'type': 'softmax', 'name': base.replace('/', '_'), 'shape': cur})
+        elif typ == 'Activation':
+            # We can't distinguish which activation from summary reliably; skip unless it's explicitly relu/softmax
+            pass
+    return steps
+
+
+def write_header_from_steps(input_shape: 'TensorShape', steps, header_path: str):
+    with open(header_path, 'w') as f:
+        guard = sanitize_symbol(os.path.basename(header_path)).upper() + "_"
+        f.write("// Auto-generated by generate_c_from_tf.py\n")
+        f.write("#ifndef %s\n#define %s\n\n" % (guard, guard))
+        f.write("#include \"tf_ops.h\"\n\n")
+
+        for line in input_shape.as_define("MODEL_INPUT"):
+            f.write(line + "\n")
+        f.write("\n")
+
+        buf_index = 0
+        tmp_buffers = []
+        for step in steps:
+            if step['type'] == 'conv2d':
+                emit_array(f, 'float', f"{step['name']}_kernel", flatten_list(step['kernel']))
+                if step['bias'] is not None:
+                    emit_array(f, 'float', f"{step['name']}_bias", [float(x) for x in step['bias'].reshape(-1)])
+                tmp_buffers.append((f"buf{buf_index}", step['out_shape'].numel()))
+                buf_index += 1
+            elif step['type'] == 'dense':
+                emit_array(f, 'float', f"{step['name']}_W", flatten_list(step['W']))
+                if step['b'] is not None:
+                    emit_array(f, 'float', f"{step['name']}_b", [float(x) for x in step['b'].reshape(-1)])
+                tmp_buffers.append((f"buf{buf_index}", step['out_features']))
+                buf_index += 1
+            elif step['type'] == 'gap2d':
+                tmp_buffers.append((f"buf{buf_index}", step['out_shape'].numel()))
+                buf_index += 1
+            elif step['type'] == 'flatten':
+                tmp_buffers.append((f"buf{buf_index}", step['out_features']))
+                buf_index += 1
+
+        if not tmp_buffers:
+            tmp_buffers.append(("buf0", input_shape.numel()))
+        for name, size in tmp_buffers:
+            f.write(f"static float {name}[{size}];\n")
+        f.write("\n")
+
+        f.write("static inline void model_infer(const float* input, float* output) {\n")
+        cur_h, cur_w, cur_c = input_shape.h, input_shape.w, input_shape.c
+        buf_read = 'input'
+        buf_write_index = 0
+        for step in steps:
+            if step['type'] == 'conv2d':
+                out_shape = step['out_shape']
+                strides = step['strides']
+                pad_same = 1 if step['padding'] == 'SAME' else 0
+                kernel = f"{step['name']}_kernel"
+                bias = f"{step['name']}_bias" if step['bias'] is not None else "NULL"
+                buf_write = f"buf{buf_write_index}"
+                f.write(
+                    f"  conv2d_nhwc({buf_read}, {cur_h}, {cur_w}, {cur_c}, {kernel}, {step['kernel'].shape[0]}, {step['kernel'].shape[1]}, {out_shape.c}, {bias}, {strides[0]}, {strides[1]}, {pad_same}, {buf_write});\n"
+                )
+                buf_read = buf_write
+                buf_write_index += 1
+                cur_h, cur_w, cur_c = out_shape.h, out_shape.w, out_shape.c
+            elif step['type'] == 'relu':
+                f.write(f"  relu({buf_read}, {cur_h*cur_w*cur_c});\n")
+            elif step['type'] == 'gap2d':
+                buf_write = f"buf{buf_write_index}"
+                f.write(f"  global_average_pool_2d({buf_read}, {cur_h}, {cur_w}, {cur_c}, {buf_write});\n")
+                buf_read = buf_write
+                buf_write_index += 1
+                cur_h, cur_w, cur_c = step['out_shape'].h, step['out_shape'].w, step['out_shape'].c
+            elif step['type'] == 'flatten':
+                out_features = step['out_features']
+                buf_write = f"buf{buf_write_index}"
+                f.write(f"  for (int i=0;i<{out_features};++i) {buf_write}[i] = ((const float*){buf_read})[i];\n")
+                buf_read = buf_write
+                buf_write_index += 1
+                cur_h, cur_w, cur_c = 1, 1, out_features
+            elif step['type'] == 'dense':
+                out_features = step['out_features']
+                W = f"{step['name']}_W"
+                b = f"{step['name']}_b" if step['b'] is not None else "NULL"
+                buf_write = f"buf{buf_write_index}"
+                in_features = cur_c if (cur_h == 1 and cur_w == 1) else (cur_h * cur_w * cur_c)
+                f.write(f"  dense({buf_read}, {in_features}, {W}, {b}, {out_features}, {buf_write});\n")
+                buf_read = buf_write
+                buf_write_index += 1
+                cur_h, cur_w, cur_c = 1, 1, out_features
+            elif step['type'] == 'softmax':
+                f.write(f"  softmax({buf_read}, {cur_h*cur_w*cur_c});\n")
+        f.write(f"  for (int i=0;i<{cur_h*cur_w*cur_c};++i) output[i] = {buf_read}[i];\n")
+        f.write("}\n\n")
+        f.write("#endif\n")
+
+
+def layer_to_c_name(layer: keras.layers.Layer) -> str:
+    base = layer.name.replace("/", "_").replace("-", "_")
+    return base
+
+
+def sanitize_symbol(name: str) -> str:
+    out = []
+    for ch in name:
+        if ch.isalnum() or ch == '_':
+            out.append(ch)
+        else:
+            out.append('_')
+    return ''.join(out)
+
+
+def emit_array(f, c_type: str, name: str, values: List[float], per_line: int = 8):
+    f.write(f"static const {c_type} {name}[{len(values)}] = {{\n")
+    f.write("{\n")
+    for i, v in enumerate(values):
+        sep = "," if i < len(values) - 1 else ""
+        end = "\n" if (i + 1) % per_line == 0 else ""
+        f.write(f"  {v:.8f}{sep}{end}")
+    if len(values) % per_line != 0:
+        f.write("\n")
+    f.write("};\n\n")
+
+
+def flatten_list(arr) -> List[float]:
+    return [float(x) for x in arr.reshape(-1)]
+
+
+class TensorShape:
+    def __init__(self, h: int, w: int, c: int):
+        self.h = int(h)
+        self.w = int(w)
+        self.c = int(c)
+
+    def numel(self) -> int:
+        return int(self.h * self.w * self.c)
+
+    def as_define(self, prefix: str) -> List[str]:
+        return [
+            f"#define {prefix}_H {self.h}",
+            f"#define {prefix}_W {self.w}",
+            f"#define {prefix}_C {self.c}",
+            f"#define {prefix}_SIZE ({prefix}_H*{prefix}_W*{prefix}_C)",
+        ]
+
+
+def infer_output_shape_conv2d(inp: TensorShape, layer: keras.layers.Conv2D) -> TensorShape:
+    strides = layer.strides
+    padding = layer.padding.upper()
+    k_h, k_w = layer.kernel_size
+    if padding == "SAME":
+        out_h = (inp.h + strides[0] - 1) // strides[0]
+        out_w = (inp.w + strides[1] - 1) // strides[1]
+    elif padding == "VALID":
+        out_h = (inp.h - k_h) // strides[0] + 1
+        out_w = (inp.w - k_w) // strides[1] + 1
+    else:
+        raise ValueError(f"Unsupported padding: {padding}")
+    out_c = layer.filters
+    return TensorShape(out_h, out_w, out_c)
+
+
+def infer_output_shape_gap2d(inp: TensorShape) -> TensorShape:
+    return TensorShape(1, 1, inp.c)
+
+
+def write_header(model, header_path: str, input_shape_opt: Optional[Tuple[int, int, int]] = None):
+    # Determine input shape
+    if hasattr(model, 'inputs') and model.inputs:
+        i_shape = _shape_tuple(model.inputs[0].shape)
+        # Expect (None, H, W, C)
+        if len(i_shape) != 4:
+            raise ValueError(f"Model input must be 4D NHWC. Got: {i_shape}")
+        _, H, W, C = i_shape
+        if H == -1 or W == -1 or C == -1:
+            if input_shape_opt is None:
+                raise ValueError("Input shape has dynamic dims. Pass --input-shape H,W,C")
+            H, W, C = input_shape_opt
+    else:
+        if input_shape_opt is None:
+            raise ValueError("Cannot determine model input. Pass --input-shape H,W,C")
+        H, W, C = input_shape_opt
+
+    input_shape = TensorShape(H, W, C)
+
+    steps = []
+    cur = input_shape
+
+    if model is not None:
+        # Keras model path
+        layers: List[keras.layers.Layer] = list(model.layers)
+        for lyr in layers:
+            if isinstance(lyr, keras.layers.InputLayer):
+                continue
+            if isinstance(lyr, keras.layers.Conv2D):
+                out_shape = infer_output_shape_conv2d(cur, lyr)
+                weights = lyr.get_weights()
+                kernel = weights[0]  # [kh, kw, Cin, Cout]
+                bias = weights[1] if lyr.use_bias and len(weights) > 1 else None
+                steps.append({
+                    'type': 'conv2d',
+                    'name': layer_to_c_name(lyr),
+                    'in_shape': cur,
+                    'out_shape': out_shape,
+                    'kernel': kernel,
+                    'bias': bias,
+                    'strides': lyr.strides,
+                    'padding': lyr.padding.upper(),
+                })
+                cur = out_shape
+                # Optional: add relu if activation is relu
+                if getattr(lyr, 'activation', None) == keras.activations.relu:
+                    steps.append({'type': 'relu', 'name': layer_to_c_name(lyr) + '_relu', 'shape': cur})
+            elif isinstance(lyr, keras.layers.ReLU):
+                steps.append({'type': 'relu', 'name': layer_to_c_name(lyr), 'shape': cur})
+            elif isinstance(lyr, keras.layers.Activation):
+                if lyr.activation == keras.activations.relu:
+                    steps.append({'type': 'relu', 'name': layer_to_c_name(lyr), 'shape': cur})
+                elif lyr.activation == keras.activations.softmax:
+                    steps.append({'type': 'softmax', 'name': layer_to_c_name(lyr), 'shape': cur})
+                else:
+                    raise ValueError(f"Unsupported Activation: {lyr.activation}")
+            elif isinstance(lyr, keras.layers.Flatten):
+                steps.append({'type': 'flatten', 'name': layer_to_c_name(lyr), 'in_shape': cur, 'out_features': cur.numel()})
+                cur = TensorShape(1, 1, cur.numel())
+            elif isinstance(lyr, keras.layers.GlobalAveragePooling2D):
+                out_shape = infer_output_shape_gap2d(cur)
+                steps.append({'type': 'gap2d', 'name': layer_to_c_name(lyr), 'in_shape': cur, 'out_shape': out_shape})
+                cur = out_shape
+            elif isinstance(lyr, keras.layers.Dense):
+                weights = lyr.get_weights()
+                W = weights[0]  # [in, out]
+                b = weights[1] if len(weights) > 1 else None
+                out_features = W.shape[1]
+                in_features = cur.c if (cur.h == 1 and cur.w == 1) else cur.numel()
+                if W.shape[0] != in_features:
+                    raise ValueError(f"Dense in_features mismatch: computed {in_features}, weights {W.shape[0]}")
+                steps.append({
+                    'type': 'dense',
+                    'name': layer_to_c_name(lyr),
+                    'in_features': in_features,
+                    'out_features': out_features,
+                    'W': W,
+                    'b': b,
+                })
+                cur = TensorShape(1, 1, out_features)
+            elif isinstance(lyr, keras.layers.Softmax):
+                steps.append({'type': 'softmax', 'name': layer_to_c_name(lyr), 'shape': cur})
+            else:
+                raise ValueError(f"Unsupported layer type in sequence: {type(lyr)}")
+    else:
+        # SavedModel fallback using variables
+        sm = try_build_from_saved_model(os.path.dirname(header_path))  # wrong dir, will fix
+        # Fix: we need model directory; pass via global? Instead, compute from model arg before calling write_header.
+        raise ValueError("Internal: SavedModel fallback requires model_dir. Use main() path.")
+
+    # Emit header
+    with open(header_path, 'w') as f:
+        guard = sanitize_symbol(os.path.basename(header_path)).upper() + "_"
+        f.write("// Auto-generated by generate_c_from_tf.py\n")
+        f.write("#ifndef %s\n#define %s\n\n" % (guard, guard))
+        f.write("#include \"tf_ops.h\"\n\n")
+
+        # Defines
+        for line in input_shape.as_define("MODEL_INPUT"):
+            f.write(line + "\n")
+        f.write("\n")
+
+        # Emit weights
+        buf_index = 0
+        tmp_buffers = []  # (name, size)
+
+        for step in steps:
+            if step['type'] == 'conv2d':
+                k = step['kernel']
+                b = step['bias']
+                name = step['name']
+                vals = flatten_list(k)
+                emit_array(f, 'float', f"{name}_kernel", vals)
+                if b is not None:
+                    emit_array(f, 'float', f"{name}_bias", [float(x) for x in b.reshape(-1)])
+                # Prepare buffer size for this output
+                out_shape: TensorShape = step['out_shape']
+                tmp_buffers.append((f"buf{buf_index}", out_shape.numel()))
+                buf_index += 1
+            elif step['type'] == 'dense':
+                W = step['W']
+                b = step['b']
+                name = step['name']
+                emit_array(f, 'float', f"{name}_W", flatten_list(W))
+                if b is not None:
+                    emit_array(f, 'float', f"{name}_b", [float(x) for x in b.reshape(-1)])
+                tmp_buffers.append((f"buf{buf_index}", step['out_features']))
+                buf_index += 1
+            elif step['type'] == 'gap2d':
+                out_shape: TensorShape = step['out_shape']
+                tmp_buffers.append((f"buf{buf_index}", out_shape.numel()))
+                buf_index += 1
+            elif step['type'] in ('relu', 'softmax', 'flatten'):
+                # No weights; still track buffer mutations when shape changes
+                if step['type'] == 'flatten':
+                    tmp_buffers.append((f"buf{buf_index}", step['out_features']))
+                    buf_index += 1
+
+        if not tmp_buffers:
+            # Model with no trainable layers; still allocate one buffer for output
+            tmp_buffers.append(("buf0", input_shape.numel()))
+
+        # Emit buffers
+        for name, size in tmp_buffers:
+            f.write(f"static float {name}[{size}];\n")
+        f.write("\n")
+
+        # Prototype
+        f.write("// input: NHWC [MODEL_INPUT_H, MODEL_INPUT_W, MODEL_INPUT_C]\n")
+        f.write("static inline void model_infer(const float* input, float* output) {\n")
+
+        # Generate body
+        cur_h, cur_w, cur_c = input_shape.h, input_shape.w, input_shape.c
+        buf_read = 'input'
+        buf_write_index = 0
+        for idx, step in enumerate(steps):
+            if step['type'] == 'conv2d':
+                out_shape: TensorShape = step['out_shape']
+                strides = step['strides']
+                pad_same = 1 if step['padding'] == 'SAME' else 0
+                kernel = f"{step['name']}_kernel"
+                bias = f"{step['name']}_bias" if step['bias'] is not None else "NULL"
+                buf_write = f"buf{buf_write_index}"
+                f.write(
+                    f"  conv2d_nhwc({buf_read}, {cur_h}, {cur_w}, {cur_c}, {kernel}, {step['kernel'].shape[0]}, {step['kernel'].shape[1]}, {out_shape.c}, {bias}, {strides[0]}, {strides[1]}, {pad_same}, {buf_write});\n"
+                )
+                buf_read = buf_write
+                buf_write_index += 1
+                cur_h, cur_w, cur_c = out_shape.h, out_shape.w, out_shape.c
+            elif step['type'] == 'relu':
+                f.write(f"  relu({buf_read}, {cur_h*cur_w*cur_c});\n")
+            elif step['type'] == 'gap2d':
+                out_shape: TensorShape = step['out_shape']
+                buf_write = f"buf{buf_write_index}"
+                f.write(f"  global_average_pool_2d({buf_read}, {cur_h}, {cur_w}, {cur_c}, {buf_write});\n")
+                buf_read = buf_write
+                buf_write_index += 1
+                cur_h, cur_w, cur_c = out_shape.h, out_shape.w, out_shape.c
+            elif step['type'] == 'flatten':
+                # NHWC to flat vector copy
+                out_features = step['out_features']
+                buf_write = f"buf{buf_write_index}"
+                f.write(f"  for (int i=0;i<{out_features};++i) {buf_write}[i] = ((const float*){buf_read})[i];\n")
+                buf_read = buf_write
+                buf_write_index += 1
+                cur_h, cur_w, cur_c = 1, 1, out_features
+            elif step['type'] == 'dense':
+                out_features = step['out_features']
+                W = f"{step['name']}_W"
+                b = f"{step['name']}_b" if step['b'] is not None else "NULL"
+                buf_write = f"buf{buf_write_index}"
+                in_features = cur_c if (cur_h == 1 and cur_w == 1) else (cur_h * cur_w * cur_c)
+                f.write(f"  dense({buf_read}, {in_features}, {W}, {b}, {out_features}, {buf_write});\n")
+                buf_read = buf_write
+                buf_write_index += 1
+                cur_h, cur_w, cur_c = 1, 1, out_features
+            elif step['type'] == 'softmax':
+                f.write(f"  softmax({buf_read}, {cur_h*cur_w*cur_c});\n")
+            else:
+                raise RuntimeError("Internal: unknown step type")
+
+        # Write output
+        f.write(f"  for (int i=0;i<{cur_h*cur_w*cur_c};++i) output[i] = {buf_read}[i];\n")
+        f.write("}\n\n")
+
+        f.write("#endif\n")
+
+
+def parse_shape_arg(s: str) -> Tuple[int, int, int]:
+    parts = [int(x) for x in s.split(',') if x.strip()]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("--input-shape must be H,W,C")
+    return parts[0], parts[1], parts[2]
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Generate C inference header from a TensorFlow/Keras model.")
+    ap.add_argument('--model', required=True, help='Path to SavedModel directory or Keras model file')
+    ap.add_argument('--out', default='TensorflowToC/model_inference.h', help='Output header path')
+    ap.add_argument('--input-shape', type=parse_shape_arg, default=None, help='Override input H,W,C if model has dynamic shape')
+    args = ap.parse_args()
+
+    model = load_model(args.model)
+    if model is not None:
+        write_header(model, args.out, args.input_shape)
+    else:
+        # SavedModel fallback
+        # Need input shape; try metadata.json next to experiment
+        HWC = args.input_shape
+        if HWC is None:
+            # Try to read metadata.json one directory up from model dir
+            model_dir = args.model
+            meta = os.path.join(os.path.dirname(model_dir), 'metadata.json')
+            if os.path.exists(meta):
+                import json
+                with open(meta, 'r') as f:
+                    md = json.load(f)
+                ishape = md.get('model_info', {}).get('input_shape') or md.get('training_config', {}).get('input_shape')
+                if isinstance(ishape, str) and ishape.startswith('(') and ishape.endswith(')'):
+                    parts = ishape.strip('()').split(',')
+                    HWC = (int(parts[0]), int(parts[1]), int(parts[2]))
+        if HWC is None:
+            raise ValueError("SavedModel fallback requires --input-shape H,W,C")
+        input_shape = TensorShape(*HWC)
+        steps = build_steps_from_saved_model(args.model, input_shape)
+        write_header_from_steps(input_shape, steps, args.out)
+    print(f"Generated {args.out}")
+
+
+if __name__ == '__main__':
+    main()

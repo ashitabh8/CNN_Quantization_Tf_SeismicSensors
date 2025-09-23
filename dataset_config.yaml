@@ -1,0 +1,29 @@
+vehicle_classification:
+        num_classes: 10 
+        class_names: ["background", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+        # Class filtering: specify which classes to include (0-based indexing)
+        # If not specified or empty, all classes will be included
+        included_classes: [0, 1, 5, 8]  # All classes by default
+        train_index_file: /home/tkimura4/data/datasets/ACIDS/random_partition_index_vehicle_classification/train_index.txt 
+        val_index_file: /home/tkimura4/data/datasets/ACIDS/random_partition_index_vehicle_classification/val_index.txt  
+        test_index_file: /home/tkimura4/data/datasets/ACIDS/random_partition_index_vehicle_classification/test_index.txt
+
+# Spectral Processing Configuration
+spectral_processing:
+  method: "welch"  # Options: "fft", "welch", "none"
+  sampling_rate: 512.0  # Sampling rate in Hz
+  
+  # Welch's Method Parameters
+  # Data is pre-windowed with 7 segments of 256 samples each (half overlap)
+  # We apply FFT to each segment and average across the 7 windows
+  welch:
+    nperseg: 32  # Not used - data is already windowed
+    noverlap: 16  # Not used - data is already windowed with half overlap
+    nfft: 32  # Length of the FFT used - gives 16 Hz bins (512 Hz / 32 = 16 Hz)
+    window: "hann"  # Not used - data is already windowed
+    scaling: "density"  # "density" for power spectral density, "spectrum" for power spectrum
+    detrend: false  # "constant", "linear", or false
+    
+  # FFT Method Parameters (legacy)
+  fft:
+    enabled: false  # Set to true to enable FFT processing

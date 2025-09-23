@@ -1,0 +1,25 @@
+# Byte-compiled / cache files
+__pycache__/
+*_pycache__*/
+*.py[cod]
+*.class
+
+# Logs
+logs/
+*.log
+
+# Experiments (misspelling included)
+experiments/
+experiemnts/
+
+# Trained models
+trained_seismic_model/
+
+# Environments
+.venv/
+venv/
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
