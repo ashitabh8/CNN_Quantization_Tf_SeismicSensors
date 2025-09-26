@@ -1,0 +1,8 @@
+Property,Value
+signal_energy,4.849601e+02
+above_mean_density,0.500000
+first_max_location,43
+last_max_location,43
+mean_change,-0.000984
+mean_abs_change,0.020246
+mean_squared_change,4.960743e-03

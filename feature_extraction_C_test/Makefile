@@ -1,23 +1,30 @@
-# Makefile for Welch's method implementation
+# Makefile for signal processing implementations
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -std=c99
 LDFLAGS = -lm
 
-# Target executable
-TARGET = welchs_test
+# Target executables
+WELCHS_TARGET = welchs_test
+PROPERTIES_TARGET = signal_properties_test
 
 # Source files
-SOURCES = welchs.c
+WELCHS_SOURCES = welchs.c
+PROPERTIES_SOURCES = signal_properties.c
 
 # Object files
-OBJECTS = $(SOURCES:.c=.o)
+WELCHS_OBJECTS = $(WELCHS_SOURCES:.c=.o)
+PROPERTIES_OBJECTS = $(PROPERTIES_SOURCES:.c=.o)
 
 # Default target
-all: $(TARGET)
+all: $(WELCHS_TARGET) $(PROPERTIES_TARGET)
 
-# Build the executable
-$(TARGET): $(OBJECTS)
-	$(CC) $(OBJECTS) -o $(TARGET) $(LDFLAGS)
+# Build Welch's method executable
+$(WELCHS_TARGET): $(WELCHS_OBJECTS)
+	$(CC) $(WELCHS_OBJECTS) -o $(WELCHS_TARGET) $(LDFLAGS)
+
+# Build signal properties executable
+$(PROPERTIES_TARGET): $(PROPERTIES_OBJECTS)
+	$(CC) $(PROPERTIES_OBJECTS) -o $(PROPERTIES_TARGET) $(LDFLAGS)
 
 # Compile source files
 %.o: %.c
@@ -25,11 +32,18 @@ $(TARGET): $(OBJECTS)
 
 # Clean build artifacts
 clean:
-	rm -f $(OBJECTS) $(TARGET) *.txt
+	rm -f $(WELCHS_OBJECTS) $(PROPERTIES_OBJECTS) $(WELCHS_TARGET) $(PROPERTIES_TARGET) *.txt
 
-# Run the test
-test: $(TARGET)
-	./$(TARGET)
+# Run Welch's test
+test-welch: $(WELCHS_TARGET)
+	./$(WELCHS_TARGET)
+
+# Run signal properties test
+test-properties: $(PROPERTIES_TARGET)
+	./$(PROPERTIES_TARGET)
+
+# Run all tests
+test: test-welch test-properties
 
 # Install dependencies (Ubuntu/Debian)
 install-deps:
