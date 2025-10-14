@@ -2,6 +2,11 @@ import os
 import tensorflow as tf
 import numpy as np
 from random import shuffle
+from typing import List, Tuple, Dict
+import re
+from pathlib import Path
+import torch
+
 try:
     from tqdm import tqdm
 except ImportError:
@@ -134,6 +139,93 @@ USAGE EXAMPLES:
    )
    ```
 """
+class Args:
+    """Simple args class to hold configuration"""
+    def __init__(self, config):
+        self.dataset_config = config
+        self.task = "vehicle_classification"
+def read_list_file(file_path: str) -> List[str]:
+    """Read a text file where each line is an item."""
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Index file not found: {path}")
+    lines = [line.strip() for line in path.read_text().splitlines()]
+    return [line for line in lines if line]
+
+
+
+
+
+def classify_item(item: str, vehicle_names: List[str]) -> str:
+    """Return the class label for an item: one of vehicle_names, 'background', or '' if mixed/unknown."""
+    if is_background_item(item):
+        return "background"
+    is_single, vehicle = is_single_vehicle_item(item, vehicle_names)
+    if is_single:
+        return vehicle
+    return ""
+
+
+def filter_single_vehicle(items: List[str], vehicle_names: List[str]) -> List[str]:
+    """Filter items to only include single-vehicle runs (excludes background)."""
+    filtered: List[str] = []
+    for item in items:
+        label = classify_item(item, vehicle_names)
+        if label in vehicle_names:
+            filtered.append(item)
+    return filtered
+
+
+def extract_distance_meters(sample: dict, vehicle_names: List[str]) -> float:
+    """Extract distance in meters for vehicle samples; returns np.nan for background/missing."""
+    # distance structure: {'nissan': 93xx}
+    try:
+        dist_dict = sample.get('distance', {})
+        if not isinstance(dist_dict, dict) or not dist_dict:
+            return float('nan')
+        # Prefer the single vehicle present in label
+        labels = sample.get('label', set())
+        vehicle_label = None
+        if isinstance(labels, set) and len(labels) == 1:
+            (vehicle_label,) = tuple(labels)
+        # Fallback: pick first known vehicle key
+        key = None
+        if vehicle_label in dist_dict:
+            key = vehicle_label
+        else:
+            for v in vehicle_names:
+                if v in dist_dict:
+                    key = v
+                    break
+        if key is None:
+            return float('nan')
+        distance_val = dist_dict[key]
+        # distance may be int-like; ensure float meters
+        return float(distance_val)
+    except Exception:
+        return float('nan')
+
+
+def filter_samples_by_max_distance(items: List[str], vehicle_names: List[str], max_distance_m: float) -> List[str]:
+    """Filter samples to only include those with distance <= max_distance_m (or background samples)."""
+    filtered = []
+    for path in items:
+        try:
+            sample = torch.load(path, map_location='cpu', weights_only=False)
+        except Exception:
+            continue
+        
+        label = classify_item(path, vehicle_names)
+        # Keep background samples (no distance constraint)
+        if label == 'background' or not sample.get('label'):
+            filtered.append(path)
+            continue
+        
+        # For vehicle samples, check distance
+        distance_m = extract_distance_meters(sample, vehicle_names)
+        if np.isfinite(distance_m) and distance_m <= max_distance_m:
+            filtered.append(path)
+    return filtered
 
 
 class MultiModalDataset:
@@ -186,7 +278,7 @@ class MultiModalDataset:
             import torch
             
             # Load the sample file
-            sample = torch.load(filepath, weights_only=True)
+            sample = torch.load(filepath, weights_only=False)
             
             # Extract label based on task type (same logic as in __getitem__)
             if isinstance(sample["label"], dict):

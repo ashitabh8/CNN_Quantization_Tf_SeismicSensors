@@ -1,0 +1,27 @@
+vehicle_classification:
+    num_classes: 10
+    class_names: ["background", "nissan", "lexus", "mazda", "benz"]
+    included_classes: [0, 1, 2, 3]
+    train_index_file: /home/tkimura4/data/datasets/2025-09-21-ICT/train_index.txt
+    val_index_file: /home/tkimura4/data/datasets/2025-09-21-ICT/val_index.txt
+
+max_distance_m: 15 # meters
+
+spectral_processing:
+  method: "welch"  # Options: "fft", "welch", "none"
+  sampling_rate: 10  # Sampling rate in Hz
+  
+  # Welch's Method Parameters
+  # Data is pre-windowed with 7 segments of 256 samples each (half overlap)
+  # We apply FFT to each segment and average across the 7 windows
+  welch:
+    nperseg: 32  # Not used - data is already windowed
+    noverlap: 16  # Not used - data is already windowed with half overlap
+    nfft: 32  # Length of the FFT used - gives 16 Hz bins (512 Hz / 32 = 16 Hz)
+    window: "hann"  # Not used - data is already windowed
+    scaling: "density"  # "density" for power spectral density, "spectrum" for power spectrum
+    detrend: false  # "constant", "linear", or false
+    
+  # FFT Method Parameters (legacy)
+  fft:
+    enabled: false  # Set to true to enable FFT processing

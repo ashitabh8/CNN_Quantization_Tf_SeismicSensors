@@ -1,0 +1,32 @@
+vehicle_classification:
+    class_names: ["background", "nissan", "lexus", "mazda", "benz"]
+    included_classes: [ "nissan","lexus", "mazda", "benz"]
+    train_index_file: /home/tkimura4/data/datasets/2025-09-21-ICT/train_index.txt
+    val_index_file: /home/tkimura4/data/datasets/2025-09-21-ICT/val_index.txt
+
+max_distance_m: 15 # meters
+batch_size: 32
+learning_rate: 0.001
+loss: "categorical_crossentropy"
+metrics: ["accuracy", "top_k_categorical_accuracy"]
+
+
+spectral_processing:
+  method: "welch"  # Options: "fft", "welch", "none"
+  sampling_rate: 100  # Sampling rate in Hz (100 samples per second)
+  
+  # Welch's Method Parameters
+  # Data shape: (1, 10, 20) where 10 time steps over 2 seconds = 100Hz sampling
+  # Each time step has 20 samples, so 10 * 20 = 200 total samples over 2 seconds
+  # We want to create a 2D spectrogram from the time series
+  welch:
+    nperseg: 10  # Use all 10 time points as one segment
+    noverlap: 5  # 50% overlap between segments
+    nfft: 20  # FFT length - should match the 20 data points per time step
+    window: "hann"  # Hann window for better spectral estimation
+    scaling: "density"  # "density" for power spectral density, "spectrum" for power spectrum
+    detrend: "constant"  # Remove DC component
+    
+  # FFT Method Parameters (legacy)
+  fft:
+    enabled: false  # Set to true to enable FFT processing
