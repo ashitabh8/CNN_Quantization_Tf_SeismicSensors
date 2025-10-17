@@ -11,6 +11,15 @@ This script shows how to:
 
 import os
 import sys
+
+# Set environment variables to optimize TensorFlow performance and reduce warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduce TensorFlow logging
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable oneDNN optimizations that cause warnings
+os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices'  # Enable XLA optimizations
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'  # Use all available GPUs
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # Allow GPU memory growth
+os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'  # Optimize GPU threading
+
 from train_and_eval import SeismicModelTrainer
 
 
@@ -48,7 +57,7 @@ def main():
         print("   This will train the CNN model on your seismic sensor data.")
         print("   Training progress will be logged to TensorBoard.")
         
-        # history = trainer.train(epochs=30)  # Reduced epochs for example
+        history = trainer.train(epochs=5)  # Reduced epochs for example
         
         # print("   Training completed successfully!")
         

@@ -3,7 +3,7 @@ from tensorflow.keras import layers
 import numpy as np
 
 
-def create_seismic_cnn_model(config,input_shape):
+def create_seismic_cnn_model(config,input_shape,embedding_size=32):
     """
     Create a simple CNN model for seismic sensor data classification.
     
@@ -19,43 +19,41 @@ def create_seismic_cnn_model(config,input_shape):
     if num_classes == 0:
         num_classes = len(config['vehicle_classification']['class_names'])
     model_name = "SeismicCNN"
+
+    print(f"Creating ultra-lightweight CNN model with input_shape={input_shape}, num_classes={num_classes}")
+    print(f"Target embedding size: {embedding_size}")
+    print("Using input normalization instead of batch normalization")
+    
     model = tf.keras.Sequential([
-        # Input layer
-        layers.Input(shape=input_shape, name='input'),
+        tf.keras.layers.Input(shape=input_shape),
         
-        # Reshape for 2D convolution if input is 1D
-        layers.Reshape((*input_shape, 1), name='reshape_to_2d') if len(input_shape) == 1 else layers.Lambda(lambda x: x, name='keep_2d'),
+        # === INPUT NORMALIZATION ===
+        # Per-input normalization to replace batch normalization
+        # tf.keras.layers.Lambda(lambda x: tf.nn.l2_normalize(x, axis=[1, 2, 3]), name='input_norm'),
         
-        # First convolutional block
-        layers.Conv2D(32, (3, 3), activation='relu', padding='same', name='conv1'),
-        layers.Dropout(0.25, name='dropout1'),
+        # === COMPRESSED ARCHITECTURE ===
+        # Block 1: Start with fewer channels
+        tf.keras.layers.Conv2D(12, (1, 3), activation='relu', padding='same', name='conv1'),
         
-        # Second convolutional block
-        layers.Conv2D(64, (3, 3), activation='relu', padding='same', name='conv2'),
-        layers.Dropout(0.25, name='dropout2'),
+        # Block 2: Moderate expansion
+        tf.keras.layers.Conv2D(24, (1, 3), activation='relu', padding='same', name='conv2'),
         
-        # Third convolutional block
-        layers.Conv2D(128, (3, 3), activation='relu', padding='same', name='conv3'),
-        layers.GlobalAveragePooling2D(name='global_avg_pool'),
-        layers.Dropout(0.5, name='dropout3'),
+        # Block 3: Peak processing with reduced channels
+        tf.keras.layers.Conv2D(32, (1, 3), activation='relu', padding='same', name='conv3'),
         
-        # Dense layer
-        layers.Dense(64, activation='relu', name='dense1'),
-        layers.Dropout(0.5, name='dropout4'),
+        # Block 4: Compression phase
+        tf.keras.layers.Conv2D(24, (1, 2), activation='relu', padding='same', name='conv4'),
         
-        # Output layer
-        layers.Dense(num_classes, activation='softmax', name='output')
+        # Block 5: Final compression to embedding
+        tf.keras.layers.Conv2D(embedding_size, (1, 2), activation='relu', padding='same', name='conv5_final'),
+        
+        # === GLOBAL POOLING & CLASSIFICATION ===
+        tf.keras.layers.GlobalAveragePooling2D(name='global_pool'),
+        
+        # Direct classification without additional dense layers
+        tf.keras.layers.Dense(num_classes, activation='softmax', name='classifier')
     ], name=model_name)
     
-    # Set model name for logging
-    model._name = model_name
-    
-    # Compile the model
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=config['learning_rate']),
-        loss=config['loss'],
-        metrics=config['metrics']
-    )
     
     return model
 
@@ -109,7 +107,7 @@ def create_simple_1d_cnn_model(input_shape, num_classes, model_name="Seismic1DCN
     return model
 
 
-def compile_model(model, learning_rate=0.001):
+def compile_model(config, model):
     """
     Compile the model with appropriate optimizer, loss, and metrics.
     
@@ -121,9 +119,9 @@ def compile_model(model, learning_rate=0.001):
         Compiled model
     """
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-        loss='categorical_crossentropy',
-        metrics=['accuracy', 'top_k_categorical_accuracy']
+        optimizer=tf.keras.optimizers.Adam(learning_rate=config['learning_rate']),
+        loss=config['loss'],
+        metrics=config['metrics']
     )
     
     return model

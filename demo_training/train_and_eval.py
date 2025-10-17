@@ -6,7 +6,11 @@ from datetime import datetime
 import json
 from tensorflow import keras
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
-import tensorflow_model_optimization as tfmot
+
+# Configure TensorFlow to reduce warnings and optimize performance
+tf.config.optimizer.set_jit(True)  # Enable XLA JIT compilation
+tf.config.threading.set_inter_op_parallelism_threads(0)  # Use all available CPU cores
+tf.config.threading.set_intra_op_parallelism_threads(0)  # Use all available CPU cores
 
 from models import create_seismic_cnn_model, create_simple_1d_cnn_model, compile_model, count_parameters
 from tensorboard_utils import TensorBoardLogger, create_experiment_id, setup_experiment_logging
@@ -112,23 +116,14 @@ class SeismicModelTrainer:
     def _create_model(self, input_shape, num_classes):
         """Create and compile the model."""
         # Determine model type based on input shape
-        if len(input_shape) == 1:
-            # 1D data (raw time series)
-            self.model = create_simple_1d_cnn_model(
-                input_shape=input_shape,
-                num_classes=num_classes,
-                model_name=self.model_name
-            )
-        else:
             # 2D data (spectrogram)
-            self.model = create_seismic_cnn_model(
-                input_shape=input_shape,
-                num_classes=num_classes,
-                model_name=self.model_name
-            )
+        self.model = create_seismic_cnn_model(
+            config=self.config,
+            input_shape=input_shape
+        )
         
         # Compile model
-        self.model = compile_model(self.model, learning_rate=0.001)
+        self.model = compile_model(self.config, self.model)
         
         # Log model architecture
         self.tensorboard_logger.log_model_architecture(self.model)
@@ -170,7 +165,7 @@ class SeismicModelTrainer:
         callbacks.append(lr_scheduler)
         
         # Model checkpointing
-        checkpoint_path = os.path.join(self.log_dirs['models_dir'], 'best_model.h5')
+        checkpoint_path = os.path.join(self.log_dirs['models_dir'], 'best_model.keras')
         model_checkpoint = ModelCheckpoint(
             filepath=checkpoint_path,
             monitor='val_accuracy',
@@ -221,8 +216,8 @@ class SeismicModelTrainer:
         # Training configuration
         training_config = {
             'epochs': epochs,
-            'validation_data': val_dataset,
-            'callbacks': callbacks,
+            'validation_data': 'TensorFlow Dataset (not serializable)',
+            'callbacks': [callback.__class__.__name__ for callback in callbacks],
             'verbose': 1
         }
         
@@ -317,7 +312,7 @@ class SeismicModelTrainer:
         print("Saving model for TensorFlow Lite Micro...")
         
         # Save the full model first
-        model_path = os.path.join(self.log_dirs['models_dir'], 'full_model.h5')
+        model_path = os.path.join(self.log_dirs['models_dir'], 'full_model.keras')
         self.model.save(model_path)
         
         # Convert to TensorFlow Lite
