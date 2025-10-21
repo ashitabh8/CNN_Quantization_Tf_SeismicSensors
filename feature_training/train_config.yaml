@@ -1,0 +1,29 @@
+vehicle_classification:
+  class_names: ["background", "nissan", "lexus", "mazda", "benz"]
+  included_classes: ["background" , "nissan","lexus", "mazda" ]
+  train_index_file: /home/tkimura4/data/datasets/2025-09-21-ICT/train_index.txt
+  val_index_file: /home/tkimura4/data/datasets/2025-09-21-ICT/val_index.txt
+
+max_distance_m: 30
+
+# features_to_use: ["total_power", "mean_abs_change", "psd_25hz", "psd_30hz", "psd_40hz"]
+
+background_filtering:
+  method: percentile  # Options: 'median', 'percentile'
+  percentile: 25     # Use 25th percentile for background threshold (only used if method='percentile')
+
+training:
+  batch_size: 32
+  epochs: 250
+  learning_rate: 0.0005
+  optimizer: adam
+  
+model:
+  hidden_layers: [64,32,16]  # Deeper network with more capacity
+  dropout_rate: 0.1
+  activation: relu
+  
+output:
+  experiment_dir: experiments
+  save_best_only: true
+  monitor: val_accuracy

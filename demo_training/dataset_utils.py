@@ -130,11 +130,11 @@ def create_mapping_vehicle_name_to_file_path(config):
             val_mapping[vehicle].append(file_path)
     
     # Print statistics
-    print("\nTraining set statistics:")
+    print("\n Total number of Training set statistics:")
     for cls in included_classes:
         print(f"{cls}: {len(train_mapping[cls])} samples")
         
-    print("\nValidation set statistics:")
+    print("\nTotal number of Validation set statistics:")
     for cls in included_classes:
         print(f"{cls}: {len(val_mapping[cls])} samples")
     
