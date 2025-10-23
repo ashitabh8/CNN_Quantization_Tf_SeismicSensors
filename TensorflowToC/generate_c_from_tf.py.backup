@@ -55,6 +55,8 @@ def load_model(model_path: str):
             if hasattr(train_utils, 'VehicleRecall'):
                 # Use the correct registration method for TensorFlow 2.x
                 tf.keras.utils.get_custom_objects()['VehicleRecall'] = train_utils.VehicleRecall
+            else:
+        else:
     except Exception as e:
         print(f"Warning: Could not register custom metrics: {e}")
     

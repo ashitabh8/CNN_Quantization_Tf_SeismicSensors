@@ -26,7 +26,8 @@ from feature_utils import (
     normalize_features, features_dict_to_array, save_feature_statistics,
     remove_background_from_training_data, 
     balance_classes_by_undersampling, 
-    undersample_background
+    undersample_background, 
+    save_features, load_features,
 )
 from train_utils import (
     calculate_background_energy_threshold, create_dense_model, compile_model,
@@ -119,11 +120,10 @@ def main():
     print("STEP 2: FEATURE EXTRACTION")
     print("="*70)
     
-    # Extract features from training data (filtered, no background)
-    print("Extracting features from training data (no background)...")
+    # Check if we should load or extract features
+    print("Extracting features from training data...")
     train_features = extract_all_features_from_data(train_data, verbose=True)
     
-    # Extract features from validation data (includes background)
     print("\nExtracting features from validation data...")
     val_features = extract_all_features_from_data(val_data, verbose=True)
     
@@ -178,19 +178,21 @@ def main():
     print("="*70)
     
     # For background threshold calculation, we need the original training data with background
-    # Load original training data again for threshold calculation
+    # If we loaded features, we can use them directly (they already include background)
     print("Loading original training data for background threshold calculation...")
     train_data_original = load_data(train_mapping)
     train_data_original = reshape_data_to_2d(train_data_original)
-    train_features_original = extract_all_features_from_data(train_data_original, verbose=False)
-    train_features_original_normalized = normalize_features(
-        train_features_original, 
+    train_features_for_threshold = extract_all_features_from_data(train_data_original, verbose=False)
+    
+    # Normalize features for threshold calculation
+    train_features_for_threshold_normalized = normalize_features(
+        train_features_for_threshold, 
         feature_statistics, 
         verbose=False
     )
     
-    # Calculate background energy threshold from original training data (with background)
-    background_threshold = calculate_background_energy_threshold(train_features_original_normalized, config)
+    # Calculate background energy threshold from training data (with background)
+    background_threshold = calculate_background_energy_threshold(train_features_for_threshold_normalized, config)
     
     # Save threshold
     threshold_path = os.path.join(experiment_dir, 'background_threshold.json')
@@ -209,6 +211,16 @@ def main():
     # Convert features to arrays
     X_train, feature_names = features_dict_to_array(train_features_normalized)
     X_val, _ = features_dict_to_array(val_features_normalized, feature_order=feature_names)
+    
+    # Print the exact feature order that goes to the model
+    print("\n" + "="*70)
+    print("FEATURE ORDER FOR MODEL INPUT")
+    print("="*70)
+    print("The features are arranged in this EXACT order for the model:")
+    for i, feature_name in enumerate(feature_names):
+        print(f"  Index {i}: {feature_name}")
+    print("="*70)
+    
     # Encode labels
     class_names = config['vehicle_classification']['included_classes']
     y_train = encode_labels(train_features_normalized['vehicle_labels'], class_names)

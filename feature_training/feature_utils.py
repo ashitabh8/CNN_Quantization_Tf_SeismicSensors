@@ -9,8 +9,8 @@ import yaml
 from collections import Counter
 import warnings
 import torch
-from scipy import signal
 from scipy.stats import f_oneway
+from scipy.signal import welch
 import json
 import warnings
 warnings.filterwarnings('ignore')
@@ -21,20 +21,62 @@ from dataset_utils import create_mapping_vehicle_name_to_file_path, filter_sampl
 
 
 # ============================================================================
+# SCIPY WELCH IMPLEMENTATION
+# ============================================================================
+
+def scipy_welch(signal, sampling_rate=100, nperseg=50, noverlap=25, nfft=64, 
+                scaling='density', detrend='constant', window='hann'):
+    """
+    Apply Welch's method using scipy.signal.welch.
+    
+    Args:
+        signal: Input signal array
+        sampling_rate: Sampling frequency in Hz
+        nperseg: Length of each segment
+        noverlap: Number of overlapping points
+        nfft: FFT length
+        scaling: 'density' (V**2/Hz) or 'spectrum' (V**2)
+        detrend: 'constant', 'linear', or False
+        window: Window type ('hann', 'boxcar', etc.)
+    
+    Returns:
+        np.array: Power spectral density or power spectrum values
+    """
+    # Convert to numpy array
+    signal_np = np.asarray(signal, dtype=np.float32)
+    
+    # Use scipy's welch function
+    freqs, psd = welch(
+        signal_np,
+        fs=sampling_rate,
+        nperseg=nperseg,
+        noverlap=noverlap,
+        nfft=nfft,
+        scaling=scaling,
+        detrend=detrend,
+        window=window,
+        return_onesided=True
+    )
+    
+    return psd
+
+
+
+# ============================================================================
 # CONFIGURATION & CONSTANTS
 # ============================================================================
 
 FEATURE_DEFINITIONS = {
     'total_power': {
-        'description': 'Sum of all PSD values',
+        'description': 'Total power in frequency domain (sum of PSD values)',
         'type': 'power',
         'requires_psd': True
     },
-    'above_mean_density': {
-        'description': 'Proportion of PSD values above mean',
-        'type': 'ratio',
-        'requires_psd': True
-    },
+    # 'above_mean_density': {
+    #     'description': 'Proportion of PSD values above mean',
+    #     'type': 'ratio',
+    #     'requires_psd': True
+    # },
     # 'mean_change': {
     #     'description': 'Mean of PSD derivatives',
     #     'type': 'change',
@@ -51,20 +93,20 @@ FEATURE_DEFINITIONS = {
         'requires_psd': True,
         'requires_freqs': True
     },
-    'psd_25hz': {
-        'description': 'PSD value at 25 Hz',
-        'type': 'power',
-        'requires_psd': True,
-        'requires_freqs': True,
-        'target_freq': 25
-    },
-    'psd_30hz': {
-        'description': 'PSD value at 30 Hz',
-        'type': 'power',
-        'requires_psd': True,
-        'requires_freqs': True,
-        'target_freq': 30
-    },
+    # 'psd_25hz': {
+    #     'description': 'PSD value at 25 Hz',
+    #     'type': 'power',
+    #     'requires_psd': True,
+    #     'requires_freqs': True,
+    #     'target_freq': 25
+    # },
+    # 'psd_30hz': {
+    #     'description': 'PSD value at 30 Hz',
+    #     'type': 'power',
+    #     'requires_psd': True,
+    #     'requires_freqs': True,
+    #     'target_freq': 30
+    # },
     'psd_35hz': {
         'description': 'PSD value at 35 Hz',
         'type': 'power',
@@ -93,7 +135,7 @@ WELCH_PARAMS = {
     'nperseg': 50,
     'noverlap': 25,
     'nfft': 64,
-    'window': 'hann',
+    'window': 'hann',  # Rectangular window (no windowing)
     'scaling': 'density',
     'detrend': 'constant'
 }
@@ -137,17 +179,20 @@ def compute_psd(sample, sampling_rate=WELCH_PARAMS['sampling_rate'],
     if sample_np.ndim != 1:
         raise ValueError(f"Sample must be 1D after flattening, got shape: {sample_np.shape}")
     
-    # Compute PSD using Welch's method on full-scale data
-    freqs, psd = signal.welch(
+    # Compute PSD using scipy's Welch's method
+    psd = scipy_welch(
         sample_np,
-        fs=sampling_rate,
+        sampling_rate=sampling_rate,
         nperseg=nperseg,
         noverlap=noverlap,
         nfft=nfft,
-        window=WELCH_PARAMS['window'],
         scaling=WELCH_PARAMS['scaling'],
-        detrend=WELCH_PARAMS['detrend']
+        detrend=WELCH_PARAMS['detrend'],
+        window=WELCH_PARAMS['window']
     )
+    
+    # Generate frequency bins to match the expected output format
+    freqs = np.linspace(0, sampling_rate/2, len(psd))
     
     return freqs, psd
 
@@ -156,9 +201,30 @@ def compute_psd(sample, sampling_rate=WELCH_PARAMS['sampling_rate'],
 # INDIVIDUAL FEATURE CALCULATORS (One function per feature)
 # ============================================================================
 
-def calc_total_power(psd):
-    """Calculate total power (sum of all PSD values)."""
-    return np.sum(psd)
+def calc_total_power(psd, freqs=None):
+    """
+    Calculate total power in frequency domain using Power Spectral Density (PSD).
+    
+    Args:
+        psd: Power spectral density values
+        freqs: Frequency bins (optional, for validation)
+    
+    Returns:
+        Total power as sum of PSD values
+    """
+    # Convert torch tensor to numpy if needed
+    if isinstance(psd, torch.Tensor):
+        psd_np = psd.numpy()
+    else:
+        psd_np = np.asarray(psd)
+    
+    # Flatten to 1D
+    if psd_np.ndim > 1:
+        psd_np = psd_np.flatten()
+    
+    # Calculate total power: sum of PSD values
+    # This represents the total power across all frequency components
+    return np.sum(psd_np)
 
 
 def calc_above_mean_density(psd):
@@ -231,7 +297,7 @@ def extract_features_from_sample(sample, freqs, psd):
     # Extract only features that are defined in FEATURE_DEFINITIONS
     for feature_name, feature_config in FEATURE_DEFINITIONS.items():
         if feature_name == 'total_power':
-            features[feature_name] = calc_total_power(psd)
+            features[feature_name] = calc_total_power(psd, freqs)
         elif feature_name == 'above_mean_density':
             features[feature_name] = calc_above_mean_density(psd)
         elif feature_name == 'mean_change':
@@ -328,7 +394,7 @@ def extract_all_features_from_data(data_dict, verbose=True):
     if verbose:
         print(f"✓ Total samples processed: {processed_count}/{total_samples}")
         print(f"  Frequency range: {freqs_cached[0]:.2f} - {freqs_cached[-1]:.2f} Hz")
-        print(f"  Feature shape: {len(all_features['total_power'])}")
+        # print(f"  Feature shape: {len(all_features['total_power'])}")
     
     return all_features
 
@@ -573,6 +639,41 @@ def load_feature_statistics(filepath):
         statistics = json.load(f)
     print(f"✓ Feature statistics loaded from: {filepath}")
     return statistics
+
+
+# ============================================================================
+# FEATURE DATA SAVE/LOAD FUNCTIONS
+# ============================================================================
+
+def save_features(features_dict, filepath):
+    """
+    Save extracted features to a pickle file for later loading.
+    
+    Args:
+        features_dict: dict containing extracted features
+        filepath: path to save the features
+    """
+    import pickle
+    with open(filepath, 'wb') as f:
+        pickle.dump(features_dict, f)
+    print(f"✓ Features saved to: {filepath}")
+
+
+def load_features(filepath):
+    """
+    Load extracted features from a pickle file.
+    
+    Args:
+        filepath: path to the saved features file
+    
+    Returns:
+        dict: loaded features
+    """
+    import pickle
+    with open(filepath, 'rb') as f:
+        features = pickle.load(f)
+    print(f"✓ Features loaded from: {filepath}")
+    return features
 
 
 # ============================================================================

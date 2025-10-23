@@ -3,11 +3,63 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Dropout
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, CSVLogger
+from tensorflow.keras.metrics import Recall
 import numpy as np
 import matplotlib.pyplot as plt
 import json
 import os
 from datetime import datetime
+
+
+class VehicleRecall(tf.keras.metrics.Metric):
+    """
+    Custom recall metric that calculates recall only for vehicle classes (excluding background).
+    """
+    def __init__(self, background_class_id=0, name='vehicle_recall', **kwargs):
+        super(VehicleRecall, self).__init__(name=name, **kwargs)
+        self.background_class_id = background_class_id
+        self.true_positives = self.add_weight(name='tp', initializer='zeros')
+        self.false_negatives = self.add_weight(name='fn', initializer='zeros')
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        # Convert to class indices
+        y_true = tf.argmax(y_true, axis=1)
+        y_pred = tf.argmax(y_pred, axis=1)
+        
+        # Create mask to exclude background class
+        mask = tf.not_equal(y_true, self.background_class_id)
+        
+        # Apply mask to get only vehicle samples
+        y_true_masked = tf.boolean_mask(y_true, mask)
+        y_pred_masked = tf.boolean_mask(y_pred, mask)
+        
+        # Calculate true positives and false negatives for vehicle classes only
+        # Use tf.cond to handle the case when no vehicle samples are present
+        tp = tf.cond(
+            tf.greater(tf.size(y_true_masked), 0),
+            lambda: tf.reduce_sum(tf.cast(tf.equal(y_true_masked, y_pred_masked), tf.float32)),
+            lambda: tf.constant(0.0, dtype=tf.float32)
+        )
+        
+        fn = tf.cond(
+            tf.greater(tf.size(y_true_masked), 0),
+            lambda: tf.reduce_sum(tf.cast(tf.not_equal(y_true_masked, y_pred_masked), tf.float32)),
+            lambda: tf.constant(0.0, dtype=tf.float32)
+        )
+        
+        self.true_positives.assign_add(tp)
+        self.false_negatives.assign_add(fn)
+
+    def result(self):
+        return tf.where(
+            tf.greater(self.true_positives + self.false_negatives, 0),
+            self.true_positives / (self.true_positives + self.false_negatives),
+            0.0
+        )
+
+    def reset_state(self):
+        self.true_positives.assign(0)
+        self.false_negatives.assign(0)
 
 
 def calculate_background_energy_threshold(train_features_dict, config):
@@ -96,10 +148,17 @@ def compile_model(model, config):
     """
     optimizer = Adam(learning_rate=config['training']['learning_rate'])
     
+    # Create macro-averaged recall metric for class imbalance
+    macro_recall = Recall(name='recall', class_id=None, dtype=None)
+    
+    # Create vehicle-only recall metric (excluding background class)
+    # Assuming background is class 0 based on your config
+    vehicle_recall = VehicleRecall(background_class_id=0, name='vehicle_recall')
+    
     model.compile(
         optimizer=optimizer,
         loss='categorical_crossentropy',
-        metrics=['accuracy']
+        metrics=['accuracy', macro_recall, vehicle_recall]
     )
     
     return model
@@ -158,9 +217,10 @@ def train_model(model, X_train, y_train, X_val, y_val, config, experiment_dir):
     # Early stopping
     early_stopping = EarlyStopping(
         monitor=config['output']['monitor'],
-        patience=10,
+        patience=30,
         restore_best_weights=True,
-        verbose=1
+        verbose=1,
+        mode='max'  # For recall metrics, we want to maximize
     )
     callbacks.append(early_stopping)
     
@@ -186,13 +246,13 @@ def train_model(model, X_train, y_train, X_val, y_val, config, experiment_dir):
 
 def plot_training_history(history, save_path):
     """
-    Plot loss and accuracy curves.
+    Plot loss, accuracy, and recall curves.
     
     Args:
         history: tf.keras.callbacks.History object
         save_path: Path to save the plot
     """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(20, 10))
     
     # Plot loss
     ax1.plot(history.history['loss'], label='Training Loss')
@@ -211,6 +271,24 @@ def plot_training_history(history, save_path):
     ax2.set_ylabel('Accuracy')
     ax2.legend()
     ax2.grid(True)
+    
+    # Plot recall (all classes)
+    ax3.plot(history.history['recall'], label='Training Recall (All Classes)')
+    ax3.plot(history.history['val_recall'], label='Validation Recall (All Classes)')
+    ax3.set_title('Model Recall (Macro-averaged - All Classes)')
+    ax3.set_xlabel('Epoch')
+    ax3.set_ylabel('Recall')
+    ax3.legend()
+    ax3.grid(True)
+    
+    # Plot vehicle recall (excluding background)
+    ax4.plot(history.history['vehicle_recall'], label='Training Vehicle Recall')
+    ax4.plot(history.history['val_vehicle_recall'], label='Validation Vehicle Recall')
+    ax4.set_title('Vehicle Recall (Excluding Background)')
+    ax4.set_xlabel('Epoch')
+    ax4.set_ylabel('Recall')
+    ax4.legend()
+    ax4.grid(True)
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
